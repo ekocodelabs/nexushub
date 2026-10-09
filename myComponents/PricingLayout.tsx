@@ -1,15 +1,49 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import Link from "next/link";
 import { FiCheck, FiX, FiZap, FiArrowRight } from "react-icons/fi";
+
+type PaidPlan = "pro" | "premium";
+type StripePriceDisplay = {
+  amount: string;
+  currency: string;
+  interval: string | null;
+  interval_count: number | null;
+};
 
 /**
  * Pricing Component
  * Features transparent tiered pricing tables with annual/monthly discount toggle.
  */
 export default function PricingLayout() {
-  const [isAnnual, setIsAnnual] = useState<boolean>(true);
+  const [stripePrices, setStripePrices] = useState<
+    Partial<Record<PaidPlan, StripePriceDisplay>>
+  >({});
+  const [checkoutPlan, setCheckoutPlan] = useState<string | null>(null);
+  const [checkoutError, setCheckoutError] = useState("");
+
+  useEffect(() => {
+    let isMounted = true;
+
+    fetch("/api/stripe/checkout")
+      .then(async (response) => {
+        if (!response.ok) throw new Error("Could not load plan prices.");
+        return response.json();
+      })
+      .then((result) => {
+        if (isMounted) setStripePrices(result.prices);
+      })
+      .catch(() => {
+        if (isMounted) {
+          setCheckoutError("Plan prices could not be loaded. Please refresh.");
+        }
+      });
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
 
   const plans = [
     {
@@ -17,9 +51,9 @@ export default function PricingLayout() {
       description:
         "Ideal for emerging creators launching their first paid community.",
       monthlyPrice: 39,
-      annualPrice: 29,
       popular: false,
-      ctaText: "Start 14-Day Free Trial",
+      ctaText: "Create a creator account",
+      checkoutPlan: null,
       features: [
         "Up to 500 Active Members",
         "1 Community Space & Chat Channel",
@@ -40,9 +74,9 @@ export default function PricingLayout() {
       description:
         "Designed for scaling creators & educators wanting full control and zero fees.",
       monthlyPrice: 99,
-      annualPrice: 79,
       popular: true,
       ctaText: "Start 14-Day Free Trial",
+      checkoutPlan: "pro",
       features: [
         "Up to 10,000 Active Members",
         "Unlimited Chat Channels & Groups",
@@ -56,13 +90,13 @@ export default function PricingLayout() {
       notIncluded: ["Dedicated Account Manager"],
     },
     {
-      name: "Enterprise",
+      name: "Premium",
       description:
         "Tailored solutions for established media brands, agencies, and large cohorts.",
       monthlyPrice: 299,
-      annualPrice: 239,
       popular: false,
-      ctaText: "Contact Sales",
+      ctaText: "Subscribe to Premium",
+      checkoutPlan: "premium",
       features: [
         "Unlimited Active Members",
         "Unlimited Everything",
@@ -76,6 +110,41 @@ export default function PricingLayout() {
       notIncluded: [],
     },
   ];
+
+  const startCheckout = async (plan: "pro" | "premium") => {
+    setCheckoutPlan(plan);
+    setCheckoutError("");
+
+    try {
+      const response = await fetch("/api/stripe/checkout", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ plan }),
+      });
+      const result = await response.json();
+
+      if (!response.ok) {
+        throw new Error(
+          response.status === 401
+            ? "Sign in as a creator to continue to checkout."
+            : response.status === 403
+              ? "This subscription is for creator accounts. Members can choose a plan from their community welcome page."
+              : (result.error ?? "Unable to start checkout."),
+        );
+      }
+
+      if (typeof result.url !== "string") {
+        throw new Error("Stripe did not provide a checkout link.");
+      }
+
+      window.location.assign(result.url);
+    } catch (error) {
+      setCheckoutError(
+        error instanceof Error ? error.message : "Unable to start checkout.",
+      );
+      setCheckoutPlan(null);
+    }
+  };
 
   return (
     <section id="pricing" className="py-24 bg-white text-slate-900 relative">
@@ -92,40 +161,49 @@ export default function PricingLayout() {
             No hidden charges. Choose a plan that fits your growth stage and
             scale your revenue with confidence.
           </p>
-
-          {/* Monthly / Annual Billing Toggle */}
-          <div className="pt-6 flex items-center justify-center gap-4">
-            <span
-              className={`text-sm font-semibold ${!isAnnual ? "text-slate-950" : "text-slate-500"}`}
-            >
-              Monthly Billing
-            </span>
-            <button
-              onClick={() => setIsAnnual(!isAnnual)}
-              className="relative w-14 h-8 bg-blue-900 rounded-full p-1 transition-colors duration-200 focus:outline-none"
-              aria-label="Toggle Billing Cycle"
-            >
-              <div
-                className={`w-6 h-6 bg-white rounded-full shadow-md transform transition-transform duration-200 ${
-                  isAnnual ? "translate-x-6" : "translate-x-0"
-                }`}
-              />
-            </button>
-            <span
-              className={`text-sm font-semibold flex items-center gap-1.5 ${isAnnual ? "text-slate-950" : "text-slate-500"}`}
-            >
-              <span>Annual Billing</span>
-              <span className="text-[10px] font-bold bg-emerald-100 text-emerald-800 px-2 py-0.5 rounded-full border border-emerald-200">
-                Save 20%
-              </span>
-            </span>
-          </div>
         </div>
+
+        {checkoutError ? (
+          <div
+            role="alert"
+            className="mx-auto mb-4 max-w-2xl rounded-xl border border-red-200 bg-red-50 p-4 text-center text-sm text-red-700"
+          >
+            {checkoutError}{" "}
+            {checkoutError.startsWith("Sign in") ? (
+              <Link href="/login" className="font-semibold underline">
+                Sign in
+              </Link>
+            ) : null}
+            {checkoutError.startsWith("This subscription") ? (
+              <Link href="/feed" className="ml-2 font-semibold underline">
+                Find your community plans
+              </Link>
+            ) : null}
+          </div>
+        ) : null}
 
         {/* Pricing Cards Grid */}
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-8 items-stretch pt-4">
           {plans.map((plan, idx) => {
-            const price = isAnnual ? plan.annualPrice : plan.monthlyPrice;
+            const stripePrice = plan.checkoutPlan
+              ? stripePrices[plan.checkoutPlan as PaidPlan]
+              : null;
+            const amount = stripePrice
+              ? Number(stripePrice.amount) / 100
+              : plan.monthlyPrice;
+            const formattedPrice = stripePrice
+              ? new Intl.NumberFormat(undefined, {
+                  style: "currency",
+                  currency: stripePrice.currency.toUpperCase(),
+                }).format(amount)
+              : plan.checkoutPlan
+                ? "Loading…"
+                : `$${amount}`;
+            const intervalCount = stripePrice?.interval_count ?? 1;
+            const interval = stripePrice?.interval;
+            const billingInterval = interval
+              ? `/${intervalCount > 1 ? `${intervalCount} ` : ""}${interval}${intervalCount > 1 ? "s" : ""}`
+              : "/month";
 
             return (
               <div
@@ -159,19 +237,14 @@ export default function PricingLayout() {
                   <div className="mb-8 pb-6 border-b border-slate-200/20">
                     <div className="flex items-baseline gap-1">
                       <span className="text-4xl sm:text-5xl font-black font-mono tracking-tight">
-                        ${price}
+                        {formattedPrice}
                       </span>
                       <span
                         className={`text-sm ${plan.popular ? "text-slate-400" : "text-slate-500"}`}
                       >
-                        /month
+                        {billingInterval}
                       </span>
                     </div>
-                    {isAnnual && (
-                      <span className="text-[11px] text-blue-400 font-medium block mt-1">
-                        Billed annually (${price * 12}/yr)
-                      </span>
-                    )}
                   </div>
 
                   {/* Features List */}
@@ -210,17 +283,35 @@ export default function PricingLayout() {
                 </div>
 
                 {/* CTA Button */}
-                <Link
-                  href="/register?role=creator"
-                  className={`w-full py-3.5 px-6 rounded-xl font-semibold text-sm transition-all text-center flex items-center justify-center gap-2 ${
-                    plan.popular
-                      ? "bg-blue-600 hover:bg-blue-500 text-white shadow-lg shadow-blue-600/30"
-                      : "bg-slate-900 hover:bg-slate-800 text-white"
-                  }`}
-                >
-                  <span>{plan.ctaText}</span>
-                  <FiArrowRight className="w-4 h-4" />
-                </Link>
+                {plan.checkoutPlan ? (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      void startCheckout(plan.checkoutPlan as "pro" | "premium")
+                    }
+                    disabled={checkoutPlan !== null}
+                    className={`w-full py-3.5 px-6 rounded-xl font-semibold text-sm transition-all text-center flex items-center justify-center gap-2 disabled:cursor-not-allowed disabled:opacity-60 ${
+                      plan.popular
+                        ? "bg-blue-600 hover:bg-blue-500 text-white shadow-lg shadow-blue-600/30"
+                        : "bg-slate-900 hover:bg-slate-800 text-white"
+                    }`}
+                  >
+                    <span>
+                      {checkoutPlan === plan.checkoutPlan
+                        ? "Redirecting…"
+                        : plan.ctaText}
+                    </span>
+                    <FiArrowRight className="w-4 h-4" />
+                  </button>
+                ) : (
+                  <Link
+                    href="/register?role=creator"
+                    className="w-full py-3.5 px-6 rounded-xl bg-slate-900 hover:bg-slate-800 text-white font-semibold text-sm transition-all text-center flex items-center justify-center gap-2"
+                  >
+                    <span>{plan.ctaText}</span>
+                    <FiArrowRight className="w-4 h-4" />
+                  </Link>
+                )}
               </div>
             );
           })}

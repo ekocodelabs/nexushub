@@ -133,11 +133,26 @@ create table if not exists public.subscriptions (
   id uuid primary key default gen_random_uuid(),
   member_id uuid not null references public.profiles(id) on delete cascade,
   community_id uuid not null references public.communities(id) on delete cascade,
+  plan text not null default 'pro' check (plan in ('pro', 'premium')),
   status text not null default 'active' check (status in ('active', 'expired', 'cancelled', 'pending')),
   expires_at timestamptz not null,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   unique (member_id, community_id)
+);
+
+-- Stores each creator's platform plan subscription separately from member
+-- subscriptions to individual communities.
+create table if not exists public.creator_subscriptions (
+  creator_id uuid primary key references public.profiles(id) on delete cascade,
+  stripe_customer_id text unique,
+  stripe_subscription_id text unique,
+  plan text not null check (plan in ('pro', 'premium')),
+  status text not null,
+  current_period_end timestamptz,
+  cancel_at_period_end boolean not null default false,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
 );
 
 -- Indexes speed up common feed and membership lookups.
@@ -155,6 +170,7 @@ alter table public.profiles enable row level security;
 alter table public.communities enable row level security;
 alter table public.posts enable row level security;
 alter table public.subscriptions enable row level security;
+alter table public.creator_subscriptions enable row level security;
 
 -- Signed-in users can read profile records; users can only create/update their
 -- own profile row.
@@ -265,6 +281,15 @@ with check (
   )
 );
 
+-- Creators can read only their own platform billing state. Writes are made by
+-- the trusted Stripe webhook using the server-only Supabase service key.
+drop policy if exists "Creators can view their platform subscription"
+on public.creator_subscriptions;
+create policy "Creators can view their platform subscription"
+on public.creator_subscriptions
+for select
+using (auth.uid() = creator_id);
+
 -- Keep updated_at current whenever a row is changed.
 create or replace function public.handle_updated_at()
 returns trigger as $$
@@ -289,4 +314,8 @@ for each row execute procedure public.handle_updated_at();
 
 create trigger set_subscriptions_updated_at
 before update on public.subscriptions
+for each row execute procedure public.handle_updated_at();
+
+create trigger set_creator_subscriptions_updated_at
+before update on public.creator_subscriptions
 for each row execute procedure public.handle_updated_at();

@@ -32,17 +32,35 @@ export default function LoginPageLayout() {
 
     try {
       const supabase = getSupabaseBrowserClient();
-      const { error: signInError } = await supabase.auth.signInWithPassword({
-        email: formData.email.trim(),
-        password: formData.password,
-      });
+      const { data: signInData, error: signInError } =
+        await supabase.auth.signInWithPassword({
+          email: formData.email.trim(),
+          password: formData.password,
+        });
 
       if (signInError) {
         throw signInError;
       }
 
       setSuccess("Signed in successfully. Redirecting to your dashboard...");
-      router.push("/dashboard");
+      const requestedNext = new URLSearchParams(window.location.search).get(
+        "next",
+      );
+      const safeNext =
+        requestedNext?.startsWith("/") && !requestedNext.startsWith("//")
+          ? requestedNext
+          : null;
+
+      if (safeNext) {
+        router.push(safeNext);
+      } else {
+        const { data: profile } = await supabase
+          .from("profiles")
+          .select("role")
+          .eq("id", signInData.user.id)
+          .maybeSingle();
+        router.push(profile?.role === "member" ? "/feed" : "/dashboard");
+      }
       router.refresh();
     } catch (submitError) {
       const message =

@@ -1,6 +1,7 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
+import { stripeClient } from "@/lib/stripe";
 
 function createWebhookSupabaseClient() {
   const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
@@ -21,11 +22,17 @@ function createWebhookSupabaseClient() {
 function validateStripeSignature(payload: string, signature: string | null) {
   const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
 
-  if (!webhookSecret || !signature) {
+  if (!webhookSecret) {
     return {
-      valid: true,
-      reason:
-        "Webhook signature validation is skipped because no secret was configured.",
+      valid: false,
+      reason: "Stripe webhook signing secret is not configured.",
+    };
+  }
+
+  if (!signature) {
+    return {
+      valid: false,
+      reason: "Missing Stripe signature header.",
     };
   }
 
@@ -44,6 +51,17 @@ function validateStripeSignature(payload: string, signature: string | null) {
     return {
       valid: false,
       reason: "Malformed Stripe signature header.",
+    };
+  }
+
+  const timestampSeconds = Number(timestamp);
+  if (
+    !Number.isFinite(timestampSeconds) ||
+    Math.abs(Date.now() / 1000 - timestampSeconds) > 300
+  ) {
+    return {
+      valid: false,
+      reason: "Stripe signature timestamp is invalid or expired.",
     };
   }
 
@@ -105,6 +123,78 @@ export async function POST(request: NextRequest) {
     const object = event?.data?.object ?? {};
     const metadata = object?.metadata ?? {};
 
+    // Creator platform plans are stored separately from community memberships.
+    const creatorId = metadata.creator_id ?? metadata.creatorId ?? null;
+    const creatorPlan = metadata.plan;
+    const isCreatorPlanEvent =
+      eventType === "checkout.session.completed" ||
+      eventType === "customer.subscription.created" ||
+      eventType === "customer.subscription.updated" ||
+      eventType === "customer.subscription.deleted";
+
+    if (
+      isCreatorPlanEvent &&
+      creatorId &&
+      (creatorPlan === "pro" || creatorPlan === "premium")
+    ) {
+      // A Checkout Session has a subscription ID; subscription events already
+      // contain the full Stripe subscription object.
+      const subscriptionId =
+        typeof object.subscription === "string"
+          ? object.subscription
+          : (object.subscription?.id ?? object.id);
+
+      if (!subscriptionId) {
+        return NextResponse.json(
+          { error: "Missing Stripe subscription ID." },
+          { status: 400 },
+        );
+      }
+
+      const stripeSubscription =
+        eventType === "checkout.session.completed"
+          ? await stripeClient.subscriptions.retrieve(subscriptionId)
+          : object;
+      const customerId =
+        typeof stripeSubscription.customer === "string"
+          ? stripeSubscription.customer
+          : (stripeSubscription.customer?.id ?? null);
+      const currentPeriodEnd = stripeSubscription.current_period_end
+        ? new Date(stripeSubscription.current_period_end * 1000).toISOString()
+        : null;
+      const supabase = createWebhookSupabaseClient();
+      const { error: subscriptionError } = await supabase
+        .from("creator_subscriptions")
+        .upsert(
+          {
+            creator_id: creatorId,
+            stripe_customer_id: customerId,
+            stripe_subscription_id: stripeSubscription.id,
+            plan: creatorPlan,
+            status: stripeSubscription.status,
+            current_period_end: currentPeriodEnd,
+            cancel_at_period_end: stripeSubscription.cancel_at_period_end,
+            updated_at: new Date().toISOString(),
+          },
+          { onConflict: "creator_id" },
+        );
+
+      if (subscriptionError) {
+        return NextResponse.json(
+          {
+            error: "Failed to save creator subscription",
+            details: subscriptionError.message,
+          },
+          { status: 500 },
+        );
+      }
+
+      return NextResponse.json(
+        { ok: true, event: eventType, creatorId, plan: creatorPlan },
+        { status: 200 },
+      );
+    }
+
     const memberId =
       metadata.member_id ??
       metadata.memberId ??
@@ -119,33 +209,67 @@ export async function POST(request: NextRequest) {
       object?.community_id ??
       null;
 
-    const isSuccessfulCheckout =
+    const isCommunitySubscriptionEvent =
       eventType === "checkout.session.completed" ||
-      eventType === "invoice.payment_succeeded" ||
-      eventType === "subscription.created" ||
-      eventType === "customer.subscription.created";
+      eventType === "customer.subscription.created" ||
+      eventType === "customer.subscription.updated" ||
+      eventType === "customer.subscription.deleted";
 
-    if (!isSuccessfulCheckout) {
+    if (!isCommunitySubscriptionEvent) {
       return NextResponse.json(
         { received: true, event: eventType },
         { status: 200 },
       );
     }
 
-    if (!memberId || !communityId) {
+    if (
+      !memberId ||
+      !communityId ||
+      (metadata.plan !== "pro" && metadata.plan !== "premium")
+    ) {
       return NextResponse.json(
         {
           error: "Missing subscription metadata",
-          details: "Expected member_id and community_id in the metadata.",
+          details:
+            "Expected member_id, community_id, and a valid plan in the metadata.",
         },
         { status: 400 },
       );
     }
 
+    // Checkout completion and later subscription lifecycle events may carry
+    // different objects, so retrieve the Stripe subscription for its period end.
+    const membershipSubscriptionId =
+      typeof object.subscription === "string"
+        ? object.subscription
+        : (object.subscription?.id ?? object.id);
+
+    if (!membershipSubscriptionId) {
+      return NextResponse.json(
+        { error: "Missing Stripe subscription ID." },
+        { status: 400 },
+      );
+    }
+
+    const membershipSubscription =
+      eventType === "checkout.session.completed"
+        ? await stripeClient.subscriptions.retrieve(membershipSubscriptionId)
+        : object;
+    const stripeStatus = membershipSubscription.status;
+    const membershipStatus =
+      eventType === "customer.subscription.deleted" ||
+      stripeStatus === "canceled" ||
+      stripeStatus === "unpaid"
+        ? "cancelled"
+        : stripeStatus === "incomplete_expired"
+          ? "expired"
+          : stripeStatus === "active" || stripeStatus === "trialing"
+            ? "active"
+            : "pending";
     const supabase = createWebhookSupabaseClient();
-    const expiresAt = new Date(
-      Date.now() + 30 * 24 * 60 * 60 * 1000,
-    ).toISOString();
+    const expiresAt = membershipSubscription.current_period_end
+      ? new Date(membershipSubscription.current_period_end * 1000).toISOString()
+      : new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
 
     const { data, error } = await supabase
       .from("subscriptions")
@@ -153,7 +277,8 @@ export async function POST(request: NextRequest) {
         {
           member_id: memberId,
           community_id: communityId,
-          status: "active",
+          plan: metadata.plan,
+          status: membershipStatus,
           expires_at: expiresAt,
           updated_at: new Date().toISOString(),
         },
